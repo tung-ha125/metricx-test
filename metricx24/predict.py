@@ -104,7 +104,7 @@ def get_dataset(
         example["input"],
         max_length=max_input_length,
         truncation=True,
-        padding=True,
+        padding='max_length',
     )
 
   def _remove_eos(example):
