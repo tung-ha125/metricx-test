@@ -65,68 +65,69 @@ class Arguments:
 def get_dataset(
     input_file: str, tokenizer, max_input_length: int, device, is_qe: bool
 ):
-  """Gets the test dataset for prediction.
+    """Gets the test dataset for prediction."""
 
-  If `is_qe` is true, the input data must have "hypothesis" and "source" fields.
-  If it is false, there must be "hypothesis" and "reference" fields.
+    def _make_input(example):
+        if is_qe:
+            example["input"] = (
+                "source: "
+                + example["source"]
+                + " candidate: "
+                + example["hypothesis"]
+            )
+        else:
+            example["input"] = (
+                "source: "
+                + example["source"]
+                + " candidate: "
+                + example["hypothesis"]
+                + " reference: "
+                + example["reference"]
+            )
+        return example
 
-  Args:
-    input_file: The path to the jsonl input file.
-    tokenizer: The tokenizer to use.
-    max_input_length: The maximum input sequence length.
-    device: The ID of the device to put the PyTorch tensors on.
-    is_qe: Indicates whether the metric is a QE metric or not.
+    def _tokenize(example):
+        return tokenizer(
+            example["input"],
+            max_length=max_input_length,
+            truncation=True,
+            padding=False,
+        )
 
-  Returns:
-    The dataset.
-  """
+    def _remove_eos(example):
+        example["input_ids"] = example["input_ids"][:-1]
+        example["attention_mask"] = example["attention_mask"][:-1]
+        return example
 
-  def _make_input(example):
-    if is_qe:
-      example["input"] = (
-          "source: "
-          + example["source"]
-          + " candidate: "
-          + example["hypothesis"]
-      )
-    else:
-      example["input"] = (
-          "source: "
-          + example["source"]
-          + " candidate: "
-          + example["hypothesis"]
-          + " reference: "
-          + example["reference"]
-      )
-    return example
+    ds = datasets.load_dataset("json", data_files={"test": input_file})
 
-  def _tokenize(example):
-    return tokenizer(
-        example["input"],
-        max_length=max_input_length,
-        truncation=True,
-        padding=False,
+    # 1. Track original index immediately
+    ds["test"] = ds["test"].map(
+        lambda x, idx: {"original_index": idx},
+        with_indices=True
     )
 
-  def _remove_eos(example):
-    example["input_ids"] = example["input_ids"][:-1]
-    example["attention_mask"] = example["attention_mask"][:-1]
-    return example
+    # 2. Process text (Tokenize)
+    ds = ds.map(_make_input)
+    ds = ds.map(_tokenize)
+    ds = ds.map(_remove_eos)
 
-  ds = datasets.load_dataset("json", data_files={"test": input_file})
-  ds = ds.map(_make_input)
-  ds = ds.map(_tokenize)
-  ds = ds.map(_remove_eos)
-  ds.set_format(
-      type="torch",
-      columns=["input_ids", "attention_mask"],
-      device=device,
-      output_all_columns=True,
-  )
+    # 3. Calculate length AFTER tokenization
+    ds["test"] = ds["test"].map(lambda x: {"length": len(x["input_ids"])})
 
-  # Add data collator for batching mode
-  data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True)
-  return ds, data_collator
+    # 4. Sort by length to boost speed (and flatten to prevent crashes)
+    ds["test"] = ds["test"].sort("length", reverse=True).flatten_indices()
+
+    ds.set_format(
+        type="torch",
+        columns=["input_ids", "attention_mask", "original_index"],
+        device=device,
+        output_all_columns=True,
+    )
+
+    # Add data collator for batching mode
+    data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True)
+    return ds, data_collator
 
 
 def main() -> None:
@@ -142,15 +143,12 @@ def main() -> None:
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(args.tokenizer)
 
-    # Load Model
     model = models.MT5ForRegression.from_pretrained(
         args.model_name_or_path, torch_dtype="auto"
     )
+
     model.to(device)
     model.eval()
-
-    # REMOVED: torch.compile(model) 
-    # Reason: It causes the Trainer to lose track of outputs, resulting in predictions=None.
 
     ds, datacollator = get_dataset(
         args.input_file,
@@ -160,81 +158,47 @@ def main() -> None:
         args.qe,
     )
 
-    # --- Sorting Logic ---
-    # 1. Add tracking columns
-    ds["test"] = ds["test"].map(
-        lambda x, idx: {"original_index": idx, "length": len(x["input_ids"])},
-        with_indices=True
-    )
-
-    # 2. Sort and FLATTEN (Fixes the IndexError)
-    sorted_test_ds = ds["test"].sort("length", reverse=True).flatten_indices()
-    
-    # 3. CRITICAL: Re-apply the format to the new sorted dataset
-    # Sometimes sort/flatten drops the "torch" format, forcing the Trainer to guess.
-    sorted_test_ds.set_format(
-        type="torch", 
-        columns=["input_ids", "attention_mask", "original_index"], 
-        output_all_columns=True
-    )
-
     training_args = transformers.TrainingArguments(
         output_dir=os.path.dirname(args.output_file),
         per_device_eval_batch_size=per_device_batch_size,
-        dataloader_pin_memory=True,
-        fp16=torch.cuda.is_available(),
+        dataloader_pin_memory=False,
     )
-
     trainer = transformers.Trainer(
         model=model,
         args=training_args,
         data_collator=datacollator
     )
-
-    # Predict
-    # predictions is a tuple (preds, label_ids, metrics). We only need preds.
-    output_obj = trainer.predict(test_dataset=sorted_test_ds)
-    predictions = output_obj.predictions
-
-    # Safety Check
-    if predictions is None:
-        raise ValueError(
-            "Trainer returned None for predictions. "
-            "This usually happens if the model is compiled with torch.compile "
-            "or if the model output signature is incompatible with the Trainer."
-        )
+    
+    # Predict on the SORTED dataset
+    predictions, _, _ = trainer.predict(test_dataset=ds["test"])
 
     dirname = os.path.dirname(args.output_file)
     if dirname:
         os.makedirs(dirname, exist_ok=True)
 
-    # Collect and Re-order
-    results_buffer = []
-    
-    # Use tqdm to show progress if helpful, otherwise just iterate
-    for pred, example in zip(predictions, sorted_test_ds):
+    # 5. Buffer results to memory to re-sort them
+    results = []
+    for pred, example in zip(predictions, ds["test"]):
         example["prediction"] = float(pred)
         
-        # Cleanup
-        for key in ["input", "input_ids", "attention_mask", "length"]:
-            example.pop(key, None)
-            
-        results_buffer.append(example)
+        # Clean up internal columns
+        del example["input"]
+        del example["input_ids"]
+        del example["attention_mask"]
+        del example["length"]
+        # Note: We keep "original_index" temporarily
+        
+        results.append(example)
 
-    # Sort back to original order
-    results_buffer.sort(key=lambda x: x["original_index"])
+    # 6. RESTORE original order using the index we tracked
+    results.sort(key=lambda x: x["original_index"])
 
-    # Save
     with open(args.output_file, "w") as out:
-        for example in results_buffer:
-            if "original_index" in example:
-                del example["original_index"]
+        for example in results:
+            # Remove the tracking index before saving
+            del example["original_index"]
             out.write(json.dumps(example) + "\n")
 
 
 if __name__ == "__main__":
     main()
-
-
-if __name__ == "__main__":
-  main()
