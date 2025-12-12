@@ -170,7 +170,7 @@ def main() -> None:
     )
 
     # 2. Sort by length descending (minimizes padding overhead)
-    sorted_test_ds = ds["test"].sort("length", reverse=True)
+    sorted_test_ds = ds["test"].sort("length", reverse=True).flatten_indices()
 
     training_args = transformers.TrainingArguments(
         output_dir=os.path.dirname(args.output_file),
