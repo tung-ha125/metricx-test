@@ -142,16 +142,15 @@ def main() -> None:
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(args.tokenizer)
 
+    # Load Model
     model = models.MT5ForRegression.from_pretrained(
         args.model_name_or_path, torch_dtype="auto"
     )
-
     model.to(device)
     model.eval()
 
-    # Optimization 1: Compile the model (if PyTorch 2.0+)
-    if hasattr(torch, "compile"):
-        model = torch.compile(model)
+    # REMOVED: torch.compile(model) 
+    # Reason: It causes the Trainer to lose track of outputs, resulting in predictions=None.
 
     ds, datacollator = get_dataset(
         args.input_file,
@@ -161,23 +160,29 @@ def main() -> None:
         args.qe,
     )
 
-    # --- NEW LOGIC: Sort for Speed, Track Index for Order ---
-    
-    # 1. Add original index and length columns
+    # --- Sorting Logic ---
+    # 1. Add tracking columns
     ds["test"] = ds["test"].map(
         lambda x, idx: {"original_index": idx, "length": len(x["input_ids"])},
         with_indices=True
     )
 
-    # 2. Sort by length descending (minimizes padding overhead)
+    # 2. Sort and FLATTEN (Fixes the IndexError)
     sorted_test_ds = ds["test"].sort("length", reverse=True).flatten_indices()
+    
+    # 3. CRITICAL: Re-apply the format to the new sorted dataset
+    # Sometimes sort/flatten drops the "torch" format, forcing the Trainer to guess.
+    sorted_test_ds.set_format(
+        type="torch", 
+        columns=["input_ids", "attention_mask", "original_index"], 
+        output_all_columns=True
+    )
 
     training_args = transformers.TrainingArguments(
         output_dir=os.path.dirname(args.output_file),
         per_device_eval_batch_size=per_device_batch_size,
         dataloader_pin_memory=True,
-        # Optimization 2: Use FP16 if on GPU
-        fp16=torch.cuda.is_available(), 
+        fp16=torch.cuda.is_available(),
     )
 
     trainer = transformers.Trainer(
@@ -186,36 +191,49 @@ def main() -> None:
         data_collator=datacollator
     )
 
-    # 3. Run prediction on the SORTED dataset
-    predictions, _, _ = trainer.predict(test_dataset=sorted_test_ds)
+    # Predict
+    # predictions is a tuple (preds, label_ids, metrics). We only need preds.
+    output_obj = trainer.predict(test_dataset=sorted_test_ds)
+    predictions = output_obj.predictions
+
+    # Safety Check
+    if predictions is None:
+        raise ValueError(
+            "Trainer returned None for predictions. "
+            "This usually happens if the model is compiled with torch.compile "
+            "or if the model output signature is incompatible with the Trainer."
+        )
 
     dirname = os.path.dirname(args.output_file)
     if dirname:
         os.makedirs(dirname, exist_ok=True)
 
-    # 4. Collect results into a list
+    # Collect and Re-order
     results_buffer = []
+    
+    # Use tqdm to show progress if helpful, otherwise just iterate
     for pred, example in zip(predictions, sorted_test_ds):
         example["prediction"] = float(pred)
         
-        # Cleanup internal columns before saving
-        del example["input"]
-        del example["input_ids"]
-        del example["attention_mask"]
-        del example["length"] 
-        # Note: Keep 'original_index' for a moment to sort back
-        
+        # Cleanup
+        for key in ["input", "input_ids", "attention_mask", "length"]:
+            example.pop(key, None)
+            
         results_buffer.append(example)
 
-    # 5. RE-ORDER: Sort the results back to their original input order
+    # Sort back to original order
     results_buffer.sort(key=lambda x: x["original_index"])
 
-    # 6. Write to file
+    # Save
     with open(args.output_file, "w") as out:
         for example in results_buffer:
-            # Remove the index now that we are done sorting
-            del example["original_index"]
+            if "original_index" in example:
+                del example["original_index"]
             out.write(json.dumps(example) + "\n")
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
