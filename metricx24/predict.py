@@ -22,6 +22,7 @@ import datasets
 from metricx24 import models
 import torch
 import transformers
+from transformers import DataCollatorWithPadding
 
 
 @dataclasses.dataclass
@@ -104,7 +105,7 @@ def get_dataset(
         example["input"],
         max_length=max_input_length,
         truncation=True,
-        padding='max_length',
+        padding=False,
     )
 
   def _remove_eos(example):
@@ -122,7 +123,10 @@ def get_dataset(
       device=device,
       output_all_columns=True,
   )
-  return ds
+
+  # Add data collator for batching mode
+  data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True)
+  return ds, data_collator
 
 
 def main() -> None:
@@ -145,12 +149,12 @@ def main() -> None:
   model.to(device)
   model.eval()
 
-  ds = get_dataset(
-      args.input_file,
-      tokenizer,
-      args.max_input_length,
-      device,
-      args.qe,
+  ds, datacollator = get_dataset(
+        args.input_file,
+        tokenizer,
+        args.max_input_length,
+        device,
+        args.qe,
   )
 
   training_args = transformers.TrainingArguments(
@@ -161,6 +165,7 @@ def main() -> None:
   trainer = transformers.Trainer(
       model=model,
       args=training_args,
+      data_collator=datacollator
   )
   predictions, _, _ = trainer.predict(test_dataset=ds["test"])
 
